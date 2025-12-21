@@ -4,10 +4,11 @@
 *.env
 
 # Storage (keep structure, ignore contents)
-storage/uploads/*
+storage/pdfs/*
 storage/audio/*
-storage/assets/*
-storage/output/*
+storage/images/*
+storage/videos/*
+storage/timelines/*
 !storage/**/.gitkeep
 
 # Database

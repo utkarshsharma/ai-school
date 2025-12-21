@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "mcp__remotion__remotion-documentation",
+      "Bash(python3 -m pip install:*)",
+      "Bash(npm install)",
+      "Bash(npm start)",
+      "Bash(curl:*)",
+      "Bash(lsof:*)",
+      "Bash(xargs kill:*)",
+      "Bash(python3 -m uvicorn:*)",
+      "Bash(python3:*)",
+      "Bash(xargs -I {} curl -s -X DELETE http://localhost:8000/api/jobs/{})"
+    ]
+  }
+}
