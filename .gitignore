@@ -1,0 +1,78 @@
+# Environment files
+.env
+.env.local
+*.env
+
+# Storage (keep structure, ignore contents)
+storage/uploads/*
+storage/audio/*
+storage/assets/*
+storage/output/*
+!storage/**/.gitkeep
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+venv/
+.venv/
+env/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dist/
+*.tsbuildinfo
+
+# Remotion
+.remotion/
+out/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Google Cloud credentials (never commit!)
+*-service-account.json
+credentials.json
