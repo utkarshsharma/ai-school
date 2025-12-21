@@ -161,7 +161,7 @@ def evaluate_timeline(raw_data: dict[str, Any], job_id: str) -> Timeline:
 
     logger.info(
         f"[{job_id}] Timeline evaluation passed: "
-        f"{len(timeline.segments)} segments, {timeline.duration_seconds:.1f}s"
+        f"{len(timeline.segments)} segments, {timeline.total_duration_seconds:.1f}s"
     )
 
     return timeline
