@@ -11,8 +11,8 @@ from src.config import get_settings
 logger = logging.getLogger(__name__)
 
 # Model constants from INSTRUCTIONS.md
-CONTENT_MODEL = "gemini-2.0-flash"  # For timeline generation
-IMAGE_MODEL = "gemini-2.0-flash-exp"  # For slide image generation
+CONTENT_MODEL = "gemini-3-flash-preview"  # For timeline generation
+IMAGE_MODEL = "gemini-2.5-flash-image"  # For slide image generation
 
 
 class GeminiError(Exception):

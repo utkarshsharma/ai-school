@@ -4,11 +4,13 @@ Uses REST API with API key authentication for simplicity.
 """
 
 import base64
+import io
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+from mutagen.mp3 import MP3
 
 from src.config import get_settings
 from src.schemas.timeline import Timeline
@@ -150,20 +152,37 @@ class TTSService:
         audio_bytes = base64.b64decode(audio_content)
         audio_path = self._storage.save_audio(job_id, segment_id, audio_bytes)
 
-        # Estimate duration (MP3 at ~128kbps)
-        # More accurate duration would require parsing the audio file
-        estimated_duration = len(audio_bytes) / (128 * 1000 / 8)
+        # Get accurate duration using mutagen
+        audio_duration = self._get_mp3_duration(audio_bytes)
 
         logger.info(
             f"[{job_id}] Audio for {segment_id}: {len(audio_bytes)} bytes, "
-            f"~{estimated_duration:.1f}s (target: {target_duration:.1f}s)"
+            f"{audio_duration:.1f}s (target: {target_duration:.1f}s)"
         )
 
         return AudioSegment(
             segment_id=segment_id,
             path=audio_path,
-            duration_seconds=estimated_duration,
+            duration_seconds=audio_duration,
         )
+
+    def _get_mp3_duration(self, audio_bytes: bytes) -> float:
+        """Get accurate MP3 duration using mutagen.
+
+        Args:
+            audio_bytes: Raw MP3 audio data
+
+        Returns:
+            Duration in seconds
+        """
+        try:
+            audio_file = io.BytesIO(audio_bytes)
+            mp3 = MP3(audio_file)
+            return mp3.info.length
+        except Exception as e:
+            logger.warning(f"Failed to parse MP3 duration: {e}, using estimate")
+            # Fallback to rough estimate (128kbps)
+            return len(audio_bytes) / (128 * 1000 / 8)
 
 
 def get_tts_service(storage: StorageService) -> TTSService:

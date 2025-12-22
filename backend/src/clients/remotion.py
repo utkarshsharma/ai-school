@@ -27,6 +27,8 @@ class RemotionClient:
         settings = get_settings()
         self._base_url = settings.remotion_service_url
         self._timeout = httpx.Timeout(600.0)  # 10 minutes for rendering
+        self._backend_url = "http://localhost:8000"  # Backend URL for serving assets
+        self._storage_base = settings.storage_base_path
 
     def health_check(self) -> bool:
         """Check if renderer is healthy."""
@@ -37,6 +39,20 @@ class RemotionClient:
         except Exception as e:
             logger.warning(f"Remotion health check failed: {e}")
             return False
+
+    def _path_to_url(self, file_path: Path) -> str:
+        """Convert a storage file path to an HTTP URL.
+
+        Remotion can't use file:// URLs, so we serve files via the backend.
+        """
+        # Get relative path from storage base
+        try:
+            relative_path = file_path.relative_to(self._storage_base)
+        except ValueError:
+            # If not relative to storage base, use the absolute path
+            relative_path = file_path
+
+        return f"{self._backend_url}/storage/{relative_path}"
 
     def render_video(
         self,
@@ -64,17 +80,27 @@ class RemotionClient:
         logger.info(f"[{job_id}] Requesting video render")
 
         # Build segment data with asset paths
+        # Use actual audio duration for slide timing (not Gemini's estimate)
         segments_data = []
         audio_map = {seg.segment_id: seg for seg in audio_segments}
+
+        # Small buffer after audio ends before transitioning (seconds)
+        transition_buffer = 0.5
 
         for segment in timeline.segments:
             audio_seg = audio_map.get(segment.segment_id)
             image_path = image_paths.get(segment.segment_id)
 
+            # Use actual audio duration + buffer, fall back to timeline if no audio
+            if audio_seg and audio_seg.duration_seconds > 0:
+                actual_duration = audio_seg.duration_seconds + transition_buffer
+            else:
+                actual_duration = segment.duration_seconds
+
             seg_data: dict[str, Any] = {
                 "segment_id": segment.segment_id,
                 "start_time_seconds": segment.start_time_seconds,
-                "duration_seconds": segment.duration_seconds,
+                "duration_seconds": actual_duration,
                 "slide": {
                     "title": segment.slide.title,
                     "bullets": segment.slide.bullets,
@@ -83,13 +109,27 @@ class RemotionClient:
                 "narration_text": segment.narration_text,
             }
 
-            # Add asset paths (use file:// URLs for local paths)
+            # Add asset paths (use HTTP URLs so Remotion can download them)
             if audio_seg:
-                seg_data["audio_path"] = f"file://{audio_seg.path.absolute()}"
+                seg_data["audio_path"] = self._path_to_url(audio_seg.path)
             if image_path:
-                seg_data["image_path"] = f"file://{image_path.absolute()}"
+                seg_data["image_path"] = self._path_to_url(image_path)
 
             segments_data.append(seg_data)
+
+            logger.debug(
+                f"[{job_id}] {segment.segment_id}: "
+                f"audio={audio_seg.duration_seconds:.1f}s, "
+                f"timeline={segment.duration_seconds:.1f}s, "
+                f"using={actual_duration:.1f}s"
+                if audio_seg else f"[{job_id}] {segment.segment_id}: no audio, using timeline {segment.duration_seconds:.1f}s"
+            )
+
+        # Calculate actual total duration from segments
+        actual_total_duration = sum(seg["duration_seconds"] for seg in segments_data)
+        logger.info(
+            f"[{job_id}] Duration: {actual_total_duration:.1f}s actual vs {timeline.total_duration_seconds:.1f}s timeline"
+        )
 
         output_path = storage.get_video_path(job_id)
 
@@ -101,7 +141,7 @@ class RemotionClient:
             "width": 1920,
             "height": 1080,
             "title": timeline.title,
-            "total_duration_seconds": timeline.total_duration_seconds,
+            "total_duration_seconds": actual_total_duration,
             "segments": segments_data,
         }
 

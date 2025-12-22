@@ -140,6 +140,52 @@ class StorageService:
             elif path.is_file():
                 path.unlink(missing_ok=True)
 
+    def has_timeline(self, job_id: str) -> bool:
+        """Check if timeline JSON exists for job."""
+        return self.get_timeline_path(job_id).exists()
+
+    def has_images(self, job_id: str) -> bool:
+        """Check if images directory exists and has files."""
+        img_dir = self.get_images_dir(job_id)
+        return img_dir.exists() and any(img_dir.glob("*.png"))
+
+    def has_audio(self, job_id: str) -> bool:
+        """Check if audio directory exists and has files."""
+        audio_dir = self.get_audio_dir(job_id)
+        return audio_dir.exists() and any(audio_dir.glob("*.mp3"))
+
+    def load_timeline_json(self, job_id: str) -> str | None:
+        """Load timeline JSON content if it exists."""
+        timeline_path = self.get_timeline_path(job_id)
+        if timeline_path.exists():
+            return timeline_path.read_text(encoding="utf-8")
+        return None
+
+    def list_images(self, job_id: str) -> dict[str, Path]:
+        """List all images for a job, keyed by segment_id."""
+        img_dir = self.get_images_dir(job_id)
+        if not img_dir.exists():
+            return {}
+        return {p.stem: p for p in img_dir.glob("*.png")}
+
+    def list_audio(self, job_id: str) -> dict[str, Path]:
+        """List all audio files for a job, keyed by segment_id."""
+        audio_dir = self.get_audio_dir(job_id)
+        if not audio_dir.exists():
+            return {}
+        return {p.stem: p for p in audio_dir.glob("*.mp3")}
+
+    def get_existing_artifacts(self, job_id: str) -> dict[str, bool]:
+        """Get summary of which artifacts exist for a job."""
+        pdf_dir = self._settings.pdf_path / job_id
+        return {
+            "pdf": pdf_dir.exists() and any(pdf_dir.glob("*.pdf")),
+            "timeline": self.has_timeline(job_id),
+            "images": self.has_images(job_id),
+            "audio": self.has_audio(job_id),
+            "video": self.get_video_path(job_id).exists(),
+        }
+
 
 # Singleton instance
 _storage_service: StorageService | None = None

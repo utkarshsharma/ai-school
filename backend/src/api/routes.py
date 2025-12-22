@@ -11,7 +11,7 @@ from src.models.database import get_db
 from src.models.job import Job, JobStatus
 from src.schemas.job import JobResponse, JobListResponse
 from src.services.storage import get_storage_service
-from src.worker.processor import enqueue_job
+from src.worker.processor import enqueue_job, enqueue_resume
 
 router = APIRouter(prefix="/api", tags=["jobs"])
 
@@ -91,15 +91,23 @@ async def get_job(
 async def delete_job(
     job_id: str,
     db: Annotated[Session, Depends(get_db)],
+    hard_delete: bool = False,
 ) -> None:
-    """Delete a job and its artifacts."""
+    """Delete a job.
+
+    Args:
+        job_id: Job ID to delete
+        hard_delete: If True, also delete all artifacts (images, audio, etc).
+                     If False (default), only delete from database, keeping artifacts.
+    """
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Delete artifacts
-    storage = get_storage_service()
-    storage.delete_job_artifacts(job_id)
+    # Only delete artifacts if hard_delete is requested
+    if hard_delete:
+        storage = get_storage_service()
+        storage.delete_job_artifacts(job_id)
 
     # Delete from database
     db.delete(job)
@@ -141,7 +149,7 @@ async def retry_job(
     job_id: str,
     db: Annotated[Session, Depends(get_db)],
 ) -> JobResponse:
-    """Retry a failed job."""
+    """Retry a failed job from scratch."""
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -163,5 +171,89 @@ async def retry_job(
 
     # Re-enqueue
     enqueue_job(job.id)
+
+    return JobResponse.model_validate(job)
+
+
+@router.get("/jobs/{job_id}/artifacts")
+async def get_job_artifacts(
+    job_id: str,
+) -> dict:
+    """Get info about existing artifacts for a job.
+
+    Useful for determining if a job can be resumed from a specific stage.
+    """
+    storage = get_storage_service()
+    artifacts = storage.get_existing_artifacts(job_id)
+
+    # Add counts for images and audio
+    images = storage.list_images(job_id)
+    audio = storage.list_audio(job_id)
+
+    return {
+        "job_id": job_id,
+        "artifacts": artifacts,
+        "image_count": len(images),
+        "audio_count": len(audio),
+        "image_segments": list(images.keys()),
+        "audio_segments": list(audio.keys()),
+    }
+
+
+@router.post("/jobs/{job_id}/resume", response_model=JobResponse)
+async def resume_job(
+    job_id: str,
+    db: Annotated[Session, Depends(get_db)],
+    from_stage: str = "render",
+) -> JobResponse:
+    """Resume a failed job from a specific stage using existing artifacts.
+
+    Args:
+        job_id: Job to resume
+        from_stage: Stage to resume from. Options:
+            - 'images': Re-generate images, TTS, and render
+            - 'tts': Re-generate TTS and render
+            - 'render': Only re-run render (fastest, uses existing images/audio)
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != JobStatus.FAILED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Can only resume failed jobs. Current status: {job.status.value}",
+        )
+
+    valid_stages = ["images", "tts", "render"]
+    if from_stage not in valid_stages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid stage. Must be one of: {valid_stages}",
+        )
+
+    # Check that required artifacts exist
+    storage = get_storage_service()
+    if not storage.has_timeline(job_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot resume: timeline not found. Use /retry instead.",
+        )
+
+    if from_stage == "render":
+        if not storage.has_audio(job_id):
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot resume from render: audio files not found. Try from_stage=tts",
+            )
+
+    # Reset job state
+    job.status = JobStatus.PROCESSING
+    job.error_message = None
+    job.retry_count += 1
+    db.commit()
+
+    # Enqueue resume
+    enqueue_resume(job_id, from_stage)
 
     return JobResponse.model_validate(job)

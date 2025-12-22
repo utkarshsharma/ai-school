@@ -11,22 +11,24 @@ Per INSTRUCTIONS.md: The system is asynchronous - video generation
 runs as a background job, the API immediately returns a job ID.
 """
 
+import json
 import logging
 import threading
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
-from typing import Callable
 
+from mutagen.mp3 import MP3
 from sqlalchemy.orm import Session
 
 from src.models.database import get_session_local
 from src.models.job import Job, JobStatus, JobStage
+from src.schemas.timeline import Timeline
 from src.services.storage import get_storage_service, StorageService
 from src.services.pdf_extractor import get_pdf_extractor
 from src.services.content_generator import get_content_generator, ContentGenerationError
 from src.services.image_generator import get_image_generator, ImageGenerationError
-from src.services.tts import get_tts_service, TTSError
+from src.services.tts import get_tts_service, TTSError, AudioSegment
 from src.clients.remotion import get_remotion_client, RemotionError
 
 logger = logging.getLogger(__name__)
@@ -201,3 +203,143 @@ def _update_stage(job: Job, db: Session, stage: JobStage, progress: int) -> None
     job.stage_progress = progress
     job.updated_at = datetime.utcnow()
     db.commit()
+
+
+def resume_job_from_stage(job_id: str, from_stage: str) -> None:
+    """Resume a job from a specific stage using existing artifacts.
+
+    This allows resuming failed jobs without re-running expensive stages.
+
+    Args:
+        job_id: Job ID to resume
+        from_stage: Stage to resume from ('images', 'tts', or 'render')
+    """
+    logger.info(f"[{job_id}] Resuming from stage: {from_stage}")
+
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+
+    try:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            logger.error(f"Job not found: {job_id}")
+            return
+
+        storage = get_storage_service()
+
+        # Load timeline from storage (required for all resume stages)
+        timeline_json = storage.load_timeline_json(job_id)
+        if not timeline_json:
+            raise ValueError(f"No timeline found for job {job_id}")
+
+        timeline = Timeline.model_validate(json.loads(timeline_json))
+        logger.info(f"[{job_id}] Loaded timeline: {len(timeline.segments)} segments")
+
+        # Load existing images
+        image_paths = storage.list_images(job_id)
+        logger.info(f"[{job_id}] Found {len(image_paths)} existing images")
+
+        # Load existing audio and convert to AudioSegment objects with actual durations
+        audio_paths = storage.list_audio(job_id)
+        audio_segments = []
+        for seg_id, path in audio_paths.items():
+            duration = _get_audio_duration(path)
+            audio_segments.append(AudioSegment(segment_id=seg_id, path=path, duration_seconds=duration))
+        logger.info(f"[{job_id}] Found {len(audio_segments)} existing audio files")
+
+        # Resume from specified stage
+        if from_stage == "images":
+            # Re-run from images onwards
+            _update_stage(job, db, JobStage.IMAGES, 0)
+            try:
+                image_generator = get_image_generator(storage)
+                image_paths = image_generator.generate_images(timeline, job_id)
+            except ImageGenerationError as e:
+                job.mark_failed(str(e), JobStage.IMAGES)
+                db.commit()
+                raise
+            _update_stage(job, db, JobStage.IMAGES, 100)
+            from_stage = "tts"  # Continue to next stage
+
+        if from_stage == "tts":
+            # Re-run TTS and render
+            _update_stage(job, db, JobStage.TTS, 0)
+            try:
+                tts_service = get_tts_service(storage)
+                audio_segments = tts_service.generate_audio(timeline, job_id)
+            except TTSError as e:
+                job.mark_failed(str(e), JobStage.TTS)
+                db.commit()
+                raise
+            _update_stage(job, db, JobStage.TTS, 100)
+            from_stage = "render"  # Continue to next stage
+
+        if from_stage == "render":
+            # Just re-run render using existing artifacts
+            _update_stage(job, db, JobStage.RENDER, 0)
+            try:
+                remotion_client = get_remotion_client()
+                video_path = remotion_client.render_video(
+                    job_id=job_id,
+                    timeline=timeline,
+                    audio_segments=audio_segments,
+                    image_paths=image_paths,
+                    storage=storage,
+                )
+                job.video_path = str(video_path)
+                job.video_duration_seconds = timeline.total_duration_seconds
+            except RemotionError as e:
+                job.mark_failed(str(e), JobStage.RENDER)
+                db.commit()
+                raise
+
+        # Mark complete
+        job.mark_completed()
+        db.commit()
+        logger.info(f"[{job_id}] Resume completed successfully")
+
+    except Exception as e:
+        logger.error(f"[{job_id}] Resume failed: {e}", exc_info=True)
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job:
+                job.mark_failed(str(e))
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+def _get_audio_duration(path: Path) -> float:
+    """Get audio file duration using mutagen.
+
+    Args:
+        path: Path to MP3 file
+
+    Returns:
+        Duration in seconds, or 0 if parsing fails
+    """
+    try:
+        mp3 = MP3(path)
+        return mp3.info.length
+    except Exception as e:
+        logger.warning(f"Failed to get audio duration for {path}: {e}")
+        return 0
+
+
+def enqueue_resume(job_id: str, from_stage: str) -> None:
+    """Enqueue a job resume request.
+
+    Args:
+        job_id: Job ID to resume
+        from_stage: Stage to resume from
+    """
+    # For now, run directly in a new thread (simpler than extending queue)
+    thread = threading.Thread(
+        target=resume_job_from_stage,
+        args=(job_id, from_stage),
+        daemon=True,
+    )
+    thread.start()
+    logger.info(f"Started resume thread for job {job_id} from stage {from_stage}")

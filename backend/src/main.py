@@ -2,9 +2,9 @@
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 
 from src.config import get_settings
 from src.models import init_db
@@ -46,6 +46,31 @@ app.add_middleware(
 
 # Include API routes
 app.include_router(api_router)
+
+# Serve storage files via HTTP (needed for Remotion to access audio/images)
+# Using route-based serving instead of StaticFiles so CORS middleware applies
+@app.get("/storage/{file_path:path}")
+@app.head("/storage/{file_path:path}")
+async def serve_storage_file(file_path: str):
+    """Serve files from storage with proper CORS headers."""
+    settings = get_settings()
+    full_path = settings.storage_base_path / file_path
+    if not full_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    if not full_path.is_file():
+        raise HTTPException(status_code=400, detail="Not a file")
+    # Determine media type
+    suffix = full_path.suffix.lower()
+    media_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".mp3": "audio/mpeg",
+        ".mp4": "video/mp4",
+        ".json": "application/json",
+    }
+    media_type = media_types.get(suffix, "application/octet-stream")
+    return FileResponse(full_path, media_type=media_type)
 
 
 @app.get("/health")

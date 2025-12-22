@@ -4,11 +4,12 @@ Per INSTRUCTIONS.md, slide images must use gemini-2.5-flash-image
 with prompts optimized for clean, minimalist, pedagogy-first slides.
 """
 
-import base64
+import io
 import logging
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai
+from PIL import Image
 
 from src.config import get_settings
 from src.schemas.timeline import Timeline
@@ -17,7 +18,7 @@ from src.services.storage import StorageService
 logger = logging.getLogger(__name__)
 
 # Model for image generation per INSTRUCTIONS.md
-IMAGE_MODEL = "gemini-2.0-flash-exp-image-generation"
+IMAGE_MODEL = "gemini-2.5-flash-image"
 
 
 class ImageGenerationError(Exception):
@@ -35,8 +36,7 @@ class ImageGenerator:
         if not settings.gemini_api_key:
             raise ImageGenerationError("GEMINI_API_KEY not configured")
 
-        genai.configure(api_key=settings.gemini_api_key)
-        self._model = genai.GenerativeModel(IMAGE_MODEL)
+        self._client = genai.Client(api_key=settings.gemini_api_key)
 
     def generate_images(self, timeline: Timeline, job_id: str) -> dict[str, Path]:
         """Generate slide images for all segments.
@@ -115,60 +115,53 @@ STYLE REQUIREMENTS:
 Generate a single image that serves as an effective slide background."""
 
         try:
-            response = self._model.generate_content(
-                full_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.4,
-                ),
+            response = self._client.models.generate_content(
+                model=IMAGE_MODEL,
+                contents=[full_prompt],
             )
 
-            # Extract image from response
-            if not response.candidates:
-                raise ImageGenerationError("No image generated")
+            # Extract image from response parts
+            for part in response.parts:
+                if part.inline_data is not None:
+                    # Get the raw image bytes directly from inline_data
+                    image_data = part.inline_data.data
 
-            # Find image part in response
-            image_data = None
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, "inline_data") and part.inline_data:
-                    if part.inline_data.mime_type.startswith("image/"):
-                        image_data = base64.b64decode(part.inline_data.data)
-                        break
+                    # If data is base64 encoded string, decode it
+                    if isinstance(image_data, str):
+                        import base64
+                        image_data = base64.b64decode(image_data)
 
-            if not image_data:
-                # If no image in response, generate a placeholder
-                logger.warning(
-                    f"[{job_id}] No image in response for {segment_id}, "
-                    "using placeholder"
-                )
-                image_data = self._create_placeholder_image(title)
+                    # Save image
+                    image_path = self._storage.save_image(job_id, segment_id, image_data)
+                    logger.info(f"[{job_id}] Saved image: {image_path}")
+                    return image_path
 
-            # Save image
-            image_path = self._storage.save_image(job_id, segment_id, image_data)
-            logger.info(f"[{job_id}] Saved image: {image_path}")
-
-            return image_path
+            # No image found in response
+            logger.warning(
+                f"[{job_id}] No image in response for {segment_id}, using placeholder"
+            )
+            image_data = self._create_placeholder_image()
+            return self._storage.save_image(job_id, segment_id, image_data)
 
         except Exception as e:
             logger.error(f"[{job_id}] Image generation error: {e}")
             # Create fallback placeholder
-            image_data = self._create_placeholder_image(title)
+            image_data = self._create_placeholder_image()
             return self._storage.save_image(job_id, segment_id, image_data)
 
-    def _create_placeholder_image(self, title: str) -> bytes:
-        """Create a simple placeholder image.
+    def _create_placeholder_image(self) -> bytes:
+        """Create a proper placeholder image using PIL.
 
         This is used when image generation fails, ensuring
         the pipeline can continue with a valid image.
         """
-        # Simple 1x1 pixel PNG (light gray)
-        # In production, this would be a proper placeholder
-        # For MVP, we use a minimal valid PNG
-        return (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-            b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00"
-            b"\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x00\x03"
-            b"\x00\x01\x00\x05\xfe\xd4\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
+        # Create a gray gradient background (1920x1080)
+        img = Image.new('RGB', (1920, 1080), color=(128, 128, 140))
+
+        # Convert to PNG bytes
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='PNG')
+        return img_byte_arr.getvalue()
 
 
 def get_image_generator(storage: StorageService) -> ImageGenerator:

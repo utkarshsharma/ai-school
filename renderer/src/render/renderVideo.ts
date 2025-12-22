@@ -1,7 +1,11 @@
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { bundle } from '@remotion/bundler';
 import { renderMedia, selectComposition } from '@remotion/renderer';
 import { RenderRequest, VideoCompositionProps, DEFAULT_STYLE } from '../remotion/types';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export interface RenderResult {
   outputPath: string;
@@ -71,8 +75,10 @@ export async function renderVideo(request: RenderRequest): Promise<RenderResult>
     outputLocation: output_path,
     inputProps,
     onProgress: ({ progress }) => {
-      if (progress % 10 < 0.01) {
-        console.log(`[${job_id}] Render progress: ${Math.round(progress * 100)}%`);
+      const percent = Math.round(progress * 100);
+      // Log every 5% progress
+      if (percent % 5 === 0) {
+        console.log(`[${job_id}] Render progress: ${percent}%`);
       }
     },
   });
