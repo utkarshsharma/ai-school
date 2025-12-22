@@ -14,14 +14,27 @@ def create_test_pdf(text: str, path: Path) -> Path:
     """Create a test PDF with given text."""
     c = canvas.Canvas(str(path), pagesize=letter)
 
-    # Split text into lines and write to PDF
+    # Split text into chunks of 10 words per line
+    words = text.split()
     y = 750
-    for line in text.split('\n'):
+    line_words = []
+
+    for word in words:
+        line_words.append(word)
+        if len(line_words) >= 10:
+            if y < 50:
+                c.showPage()
+                y = 750
+            c.drawString(72, y, ' '.join(line_words))
+            y -= 15
+            line_words = []
+
+    # Write remaining words
+    if line_words:
         if y < 50:
             c.showPage()
             y = 750
-        c.drawString(72, y, line[:80])  # Limit line length
-        y -= 15
+        c.drawString(72, y, ' '.join(line_words))
 
     c.save()
     return path
