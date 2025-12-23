@@ -1,6 +1,7 @@
 """Text-to-Speech service using Google Cloud TTS API.
 
 Uses REST API with API key authentication for simplicity.
+Includes retry logic for transient API failures.
 """
 
 import base64
@@ -17,11 +18,16 @@ from mutagen.mp3 import MP3
 from src.config import get_settings
 from src.schemas.timeline import Timeline
 from src.services.storage import StorageService
+from src.utils.retry import retry_call
 
 logger = logging.getLogger(__name__)
 
 # Number of parallel TTS generation workers (default: 4)
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", "4"))
+
+# Retry configuration for TTS API calls
+TTS_MAX_RETRIES = int(os.getenv("TTS_MAX_RETRIES", "3"))
+TTS_RETRY_BASE_DELAY = float(os.getenv("TTS_RETRY_BASE_DELAY", "1.0"))
 
 TTS_API_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
@@ -42,6 +48,12 @@ DEFAULT_AUDIO_CONFIG = {
 
 class TTSError(Exception):
     """Error during text-to-speech generation."""
+
+    pass
+
+
+class TTSRetryableError(TTSError):
+    """Retryable TTS error (timeout, network error, server error)."""
 
     pass
 
@@ -136,6 +148,8 @@ class TTSService:
     ) -> AudioSegment:
         """Generate audio for a single segment.
 
+        Uses retry logic for transient API failures.
+
         Args:
             segment_id: Segment identifier
             text: Narration text
@@ -154,20 +168,46 @@ class TTSService:
             "audioConfig": DEFAULT_AUDIO_CONFIG,
         }
 
-        # Call TTS API
+        def _call_tts_api() -> dict:
+            """Inner function for TTS API call with retry."""
+            try:
+                with httpx.Client(timeout=60.0) as client:
+                    response = client.post(
+                        TTS_API_URL,
+                        params={"key": self._api_key},
+                        json=request_body,
+                    )
+                    response.raise_for_status()
+                    return response.json()
+            except httpx.TimeoutException as e:
+                # Timeout is retryable
+                raise TTSRetryableError(f"TTS request timed out for {segment_id}") from e
+            except httpx.HTTPStatusError as e:
+                # 5xx errors are retryable, 4xx are not
+                if e.response.status_code >= 500:
+                    raise TTSRetryableError(
+                        f"TTS API error {e.response.status_code}: {e.response.text}"
+                    ) from e
+                # 4xx errors are not retryable
+                raise TTSError(
+                    f"TTS API error: {e.response.status_code} - {e.response.text}"
+                ) from e
+            except httpx.RequestError as e:
+                # Network errors are retryable
+                raise TTSRetryableError(f"TTS network error: {e}") from e
+
+        # Call TTS API with retry
         try:
-            with httpx.Client(timeout=60.0) as client:
-                response = client.post(
-                    TTS_API_URL,
-                    params={"key": self._api_key},
-                    json=request_body,
-                )
-                response.raise_for_status()
-                result = response.json()
-        except httpx.TimeoutException:
-            raise TTSError(f"TTS request timed out for {segment_id}")
-        except httpx.HTTPStatusError as e:
-            raise TTSError(f"TTS API error: {e.response.status_code} - {e.response.text}")
+            result = retry_call(
+                _call_tts_api,
+                max_retries=TTS_MAX_RETRIES,
+                base_delay=TTS_RETRY_BASE_DELAY,
+                retryable_exceptions=(TTSRetryableError,),
+                context=f"{job_id}/{segment_id}",
+            )
+        except TTSRetryableError as e:
+            # Convert to non-retryable error after all retries exhausted
+            raise TTSError(str(e)) from e
 
         # Extract audio content
         audio_content = result.get("audioContent")

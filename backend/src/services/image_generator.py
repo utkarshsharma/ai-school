@@ -2,6 +2,7 @@
 
 Per INSTRUCTIONS.md, slide images must use gemini-2.5-flash-image
 with prompts optimized for clean, minimalist, pedagogy-first slides.
+Includes retry logic for transient API failures.
 """
 
 import io
@@ -17,11 +18,16 @@ from src.clients.gemini import get_gemini_rate_limiter
 from src.config import get_settings
 from src.schemas.timeline import Timeline
 from src.services.storage import StorageService
+from src.utils.retry import retry_call
 
 logger = logging.getLogger(__name__)
 
 # Number of parallel image generation workers (default: 4)
 IMAGE_WORKERS = int(os.getenv("IMAGE_WORKERS", "4"))
+
+# Retry configuration for image generation
+IMAGE_MAX_RETRIES = int(os.getenv("IMAGE_MAX_RETRIES", "3"))
+IMAGE_RETRY_BASE_DELAY = float(os.getenv("IMAGE_RETRY_BASE_DELAY", "2.0"))
 
 # Model for image generation per INSTRUCTIONS.md
 IMAGE_MODEL = "gemini-2.5-flash-image"
@@ -29,6 +35,12 @@ IMAGE_MODEL = "gemini-2.5-flash-image"
 
 class ImageGenerationError(Exception):
     """Error during image generation."""
+
+    pass
+
+
+class ImageRetryableError(ImageGenerationError):
+    """Retryable image generation error (API timeout, rate limit, server error)."""
 
     pass
 
@@ -108,7 +120,8 @@ class ImageGenerator:
     ) -> Path:
         """Generate a single slide background image.
 
-        Uses the Gemini rate limiter to control concurrent API calls.
+        Uses the Gemini rate limiter to control concurrent API calls,
+        with retry logic for transient failures.
 
         Args:
             segment_id: Segment identifier
@@ -141,40 +154,57 @@ STYLE REQUIREMENTS:
 
 Generate a single image that serves as an effective slide background."""
 
-        try:
+        def _call_image_api() -> bytes:
+            """Inner function for image API call with retry."""
             # Use rate limiter to control concurrent API calls
             with rate_limiter:
-                response = self._client.models.generate_content(
-                    model=IMAGE_MODEL,
-                    contents=[full_prompt],
-                )
+                try:
+                    response = self._client.models.generate_content(
+                        model=IMAGE_MODEL,
+                        contents=[full_prompt],
+                    )
 
-                # Extract image from response parts
-                for part in response.parts:
-                    if part.inline_data is not None:
-                        # Get the raw image bytes directly from inline_data
-                        image_data = part.inline_data.data
+                    # Extract image from response parts
+                    for part in response.parts:
+                        if part.inline_data is not None:
+                            # Get the raw image bytes directly from inline_data
+                            image_data = part.inline_data.data
 
-                        # If data is base64 encoded string, decode it
-                        if isinstance(image_data, str):
-                            import base64
-                            image_data = base64.b64decode(image_data)
+                            # If data is base64 encoded string, decode it
+                            if isinstance(image_data, str):
+                                import base64
+                                image_data = base64.b64decode(image_data)
 
-                        # Save image
-                        image_path = self._storage.save_image(job_id, segment_id, image_data)
-                        logger.info(f"[{job_id}] Saved image: {image_path}")
-                        return image_path
+                            return image_data
 
-                # No image found in response
-                logger.warning(
-                    f"[{job_id}] No image in response for {segment_id}, using placeholder"
-                )
-                image_data = self._create_placeholder_image()
-                return self._storage.save_image(job_id, segment_id, image_data)
+                    # No image found in response - retryable
+                    raise ImageRetryableError(f"No image in response for {segment_id}")
 
-        except Exception as e:
-            logger.error(f"[{job_id}] Image generation error: {e}")
-            # Create fallback placeholder
+                except ImageRetryableError:
+                    raise
+                except Exception as e:
+                    # Treat API errors as retryable
+                    raise ImageRetryableError(f"Image API error: {e}") from e
+
+        # Try to generate image with retries
+        try:
+            image_data = retry_call(
+                _call_image_api,
+                max_retries=IMAGE_MAX_RETRIES,
+                base_delay=IMAGE_RETRY_BASE_DELAY,
+                retryable_exceptions=(ImageRetryableError,),
+                context=f"{job_id}/{segment_id}",
+            )
+            image_path = self._storage.save_image(job_id, segment_id, image_data)
+            logger.info(f"[{job_id}] Saved image: {image_path}")
+            return image_path
+
+        except ImageRetryableError as e:
+            # All retries exhausted - fall back to placeholder
+            logger.warning(
+                f"[{job_id}] Image generation failed after retries for {segment_id}: {e}. "
+                "Using placeholder."
+            )
             image_data = self._create_placeholder_image()
             return self._storage.save_image(job_id, segment_id, image_data)
 

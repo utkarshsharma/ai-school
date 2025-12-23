@@ -9,6 +9,7 @@ from typing import Any
 import google.generativeai as genai
 
 from src.config import get_settings
+from src.utils.retry import retry_call
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,17 @@ class GeminiError(Exception):
     pass
 
 
+class GeminiRetryableError(GeminiError):
+    """Retryable Gemini error (rate limit, transient failure, malformed response)."""
+
+    pass
+
+
+# Retry configuration for Gemini API calls
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
+GEMINI_RETRY_BASE_DELAY = float(os.getenv("GEMINI_RETRY_BASE_DELAY", "2.0"))
+
+
 class GeminiClient:
     """Client for Gemini API interactions."""
 
@@ -81,6 +93,8 @@ class GeminiClient:
     ) -> dict[str, Any]:
         """Generate video timeline from PDF content.
 
+        Uses retry with exponential backoff for transient errors.
+
         Args:
             pdf_content: Extracted text from PDF
             filename: Original PDF filename
@@ -90,45 +104,61 @@ class GeminiClient:
             Parsed timeline JSON
 
         Raises:
-            GeminiError: If generation or parsing fails
+            GeminiError: If generation or parsing fails after all retries
         """
         logger.info(f"[{job_id}] Generating timeline for: {filename}")
 
         prompt = self._build_timeline_prompt(pdf_content, filename)
 
-        try:
-            response = self._content_model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.7,
-                    top_p=0.95,
-                    max_output_tokens=8192,
-                    response_mime_type="application/json",
-                ),
-            )
-
-            if not response.text:
-                raise GeminiError("Empty response from Gemini")
-
-            # Parse JSON response
+        def _call_api() -> dict[str, Any]:
+            """Inner function for API call with retry logic."""
             try:
-                timeline_data = json.loads(response.text)
-            except json.JSONDecodeError as e:
-                logger.error(f"[{job_id}] Failed to parse timeline JSON: {e}")
-                raise GeminiError(f"Invalid JSON response: {e}") from e
+                response = self._content_model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.7,
+                        top_p=0.95,
+                        max_output_tokens=8192,
+                        response_mime_type="application/json",
+                    ),
+                )
 
-            logger.info(
-                f"[{job_id}] Generated timeline with "
-                f"{len(timeline_data.get('segments', []))} segments"
-            )
+                if not response.text:
+                    # Empty response is retryable
+                    raise GeminiRetryableError("Empty response from Gemini")
 
-            return timeline_data
+                # Parse JSON response
+                try:
+                    timeline_data = json.loads(response.text)
+                except json.JSONDecodeError as e:
+                    # JSON parse error is retryable (might be truncated response)
+                    raise GeminiRetryableError(f"Invalid JSON response: {e}") from e
 
-        except Exception as e:
-            if isinstance(e, GeminiError):
+                logger.info(
+                    f"[{job_id}] Generated timeline with "
+                    f"{len(timeline_data.get('segments', []))} segments"
+                )
+
+                return timeline_data
+
+            except GeminiRetryableError:
                 raise
-            logger.error(f"[{job_id}] Gemini API error: {e}")
-            raise GeminiError(f"Gemini API error: {e}") from e
+            except Exception as e:
+                # Treat other API errors as retryable
+                logger.warning(f"[{job_id}] Gemini API error (will retry): {e}")
+                raise GeminiRetryableError(f"Gemini API error: {e}") from e
+
+        try:
+            return retry_call(
+                _call_api,
+                max_retries=GEMINI_MAX_RETRIES,
+                base_delay=GEMINI_RETRY_BASE_DELAY,
+                retryable_exceptions=(GeminiRetryableError,),
+                context=job_id,
+            )
+        except GeminiRetryableError as e:
+            # Convert to non-retryable error after all retries exhausted
+            raise GeminiError(str(e)) from e
 
     def _build_timeline_prompt(self, pdf_content: str, filename: str) -> str:
         """Build the prompt for timeline generation."""
