@@ -13,6 +13,7 @@ class JobStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class JobStage(str, Enum):
@@ -42,11 +43,24 @@ class JobResponse(BaseModel):
     video_duration_seconds: float | None = None
     slide_count: int | None = None
     error_message: str | None = None
+    error_stage: JobStage | None = None
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
 
+    # Observability fields
+    stage_started_at: datetime | None = None
+    stage_durations: dict[str, float] = Field(default_factory=dict)
+
     model_config = {"from_attributes": True}
+
+    @classmethod
+    def model_validate(cls, obj, **kwargs):
+        """Custom validation to handle None stage_durations from DB."""
+        # If stage_durations is None, convert to empty dict before validation
+        if hasattr(obj, "stage_durations") and obj.stage_durations is None:
+            obj.stage_durations = {}
+        return super().model_validate(obj, **kwargs)
 
 
 class JobListResponse(BaseModel):

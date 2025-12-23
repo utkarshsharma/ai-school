@@ -13,7 +13,20 @@ from src.schemas.job import JobResponse, JobListResponse
 from src.services.storage import get_storage_service
 from src.worker.processor import enqueue_job, enqueue_resume
 
+# API version - increment for breaking changes
+API_VERSION = "1.0.0"
+
 router = APIRouter(prefix="/api", tags=["jobs"])
+
+
+@router.get("/version")
+async def get_version() -> dict:
+    """Get API version information."""
+    return {
+        "api_version": API_VERSION,
+        "schema_version": "1.0",
+        "service": "ai-school-backend",
+    }
 
 
 @router.post("/jobs", response_model=JobResponse, status_code=201)
@@ -175,6 +188,34 @@ async def retry_job(
     return JobResponse.model_validate(job)
 
 
+@router.get("/jobs/{job_id}/logs")
+async def get_job_logs(
+    job_id: str,
+    db: Annotated[Session, Depends(get_db)],
+) -> dict:
+    """Get observability logs for a job.
+
+    Returns timing information for each pipeline stage,
+    useful for debugging and monitoring.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return {
+        "job_id": job_id,
+        "status": job.status.value if job.status else None,
+        "current_stage": job.current_stage.value if job.current_stage else None,
+        "stage_progress": job.stage_progress,
+        "stage_started_at": job.stage_started_at.isoformat() if job.stage_started_at else None,
+        "stage_durations": job.stage_durations or {},
+        "error_message": job.error_message,
+        "error_stage": job.error_stage.value if job.error_stage else None,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
+
+
 @router.get("/jobs/{job_id}/artifacts")
 async def get_job_artifacts(
     job_id: str,
@@ -198,6 +239,42 @@ async def get_job_artifacts(
         "image_segments": list(images.keys()),
         "audio_segments": list(audio.keys()),
     }
+
+
+@router.post("/jobs/{job_id}/cancel", response_model=JobResponse)
+async def cancel_job(
+    job_id: str,
+    db: Annotated[Session, Depends(get_db)],
+) -> JobResponse:
+    """Request cancellation of a processing job.
+
+    The job will be cancelled at the next stage boundary.
+    If the job is pending, it will be cancelled immediately.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status == JobStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Cannot cancel a completed job")
+
+    if job.status == JobStatus.CANCELLED:
+        raise HTTPException(status_code=400, detail="Job is already cancelled")
+
+    if job.status == JobStatus.FAILED:
+        raise HTTPException(status_code=400, detail="Cannot cancel a failed job")
+
+    if job.status == JobStatus.PENDING:
+        # Cancel immediately if not yet started
+        job.mark_cancelled()
+        db.commit()
+        return JobResponse.model_validate(job)
+
+    # For processing jobs, set the cancel flag
+    job.request_cancel()
+    db.commit()
+
+    return JobResponse.model_validate(job)
 
 
 @router.post("/jobs/{job_id}/resume", response_model=JobResponse)

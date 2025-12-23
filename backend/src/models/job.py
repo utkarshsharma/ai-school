@@ -5,6 +5,8 @@ from datetime import datetime
 from enum import Enum
 
 from sqlalchemy import Column, DateTime, Enum as SQLEnum, Float, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.types import JSON
 
 from src.models.database import Base
 
@@ -16,6 +18,7 @@ class JobStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class JobStage(str, Enum):
@@ -43,6 +46,10 @@ class Job(Base):
     current_stage = Column(SQLEnum(JobStage), nullable=True)
     stage_progress = Column(Integer, default=0)  # 0-100
 
+    # Observability - timing per stage
+    stage_started_at = Column(DateTime, nullable=True)
+    stage_durations = Column(JSON, default=dict)  # {"extract": 1.2, "generate": 45.3, ...}
+
     # Input
     original_filename = Column(String(255), nullable=False)
     pdf_path = Column(String(512), nullable=False)
@@ -60,6 +67,9 @@ class Job(Base):
     error_message = Column(Text, nullable=True)
     error_stage = Column(SQLEnum(JobStage), nullable=True)
     retry_count = Column(Integer, default=0)
+
+    # Cancellation flag - checked between pipeline stages
+    cancel_requested = Column(Integer, default=0)  # 0=false, 1=true (SQLite compat)
 
     def __repr__(self) -> str:
         return f"<Job {self.id[:8]} status={self.status.value}>"
@@ -84,4 +94,15 @@ class Job(Base):
         self.status = JobStatus.FAILED
         self.error_message = error
         self.error_stage = stage or self.current_stage
+        self.updated_at = datetime.utcnow()
+
+    def mark_cancelled(self) -> None:
+        """Mark job as cancelled."""
+        self.status = JobStatus.CANCELLED
+        self.cancel_requested = 0  # Reset flag
+        self.updated_at = datetime.utcnow()
+
+    def request_cancel(self) -> None:
+        """Request cancellation - will be processed between stages."""
+        self.cancel_requested = 1
         self.updated_at = datetime.utcnow()

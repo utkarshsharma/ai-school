@@ -87,23 +87,26 @@ class TestImageGenerator:
         """Test successful image generation."""
         timeline = create_mock_timeline(num_segments=3)
 
-        # Mock the Gemini response with image data
-        mock_response = MagicMock()
-        mock_candidate = MagicMock()
+        # Mock the Gemini Client response with image data
+        # The implementation uses genai.Client().models.generate_content()
+        # and iterates over response.parts looking for inline_data
         mock_part = MagicMock()
         mock_inline_data = MagicMock()
-        mock_inline_data.mime_type = "image/png"
-        mock_inline_data.data = base64.b64encode(b"fake image data")
+        mock_inline_data.data = b"fake image data"  # Raw bytes, not base64 encoded
         mock_part.inline_data = mock_inline_data
-        mock_candidate.content.parts = [mock_part]
-        mock_response.candidates = [mock_candidate]
 
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = mock_response
+        mock_response = MagicMock()
+        mock_response.parts = [mock_part]
+
+        mock_models = MagicMock()
+        mock_models.generate_content.return_value = mock_response
+
+        mock_client = MagicMock()
+        mock_client.models = mock_models
 
         with patch("src.services.image_generator.get_settings", return_value=mock_settings):
             with patch("src.services.image_generator.genai") as mock_genai:
-                mock_genai.GenerativeModel.return_value = mock_model
+                mock_genai.Client.return_value = mock_client
                 generator = ImageGenerator(mock_storage)
                 result = generator.generate_images(timeline, "job-001")
 
@@ -111,7 +114,7 @@ class TestImageGenerator:
         assert "seg_001" in result
         assert "seg_002" in result
         assert "seg_003" in result
-        assert mock_model.generate_content.call_count == 3
+        assert mock_models.generate_content.call_count == 3
 
     def test_generate_images_uses_placeholder_on_failure(
         self,
@@ -121,16 +124,19 @@ class TestImageGenerator:
         """Test that placeholder is used when image generation fails."""
         timeline = create_mock_timeline(num_segments=3)
 
-        # Mock empty response (no image data)
+        # Mock empty response (no parts with inline_data)
         mock_response = MagicMock()
-        mock_response.candidates = []
+        mock_response.parts = []
 
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = mock_response
+        mock_models = MagicMock()
+        mock_models.generate_content.return_value = mock_response
+
+        mock_client = MagicMock()
+        mock_client.models = mock_models
 
         with patch("src.services.image_generator.get_settings", return_value=mock_settings):
             with patch("src.services.image_generator.genai") as mock_genai:
-                mock_genai.GenerativeModel.return_value = mock_model
+                mock_genai.Client.return_value = mock_client
                 generator = ImageGenerator(mock_storage)
                 result = generator.generate_images(timeline, "job-002")
 
@@ -151,14 +157,17 @@ class TestImageGenerator:
         mock_storage.save_image.side_effect = IOError("Disk full")
 
         mock_response = MagicMock()
-        mock_response.candidates = []
+        mock_response.parts = []
 
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = mock_response
+        mock_models = MagicMock()
+        mock_models.generate_content.return_value = mock_response
+
+        mock_client = MagicMock()
+        mock_client.models = mock_models
 
         with patch("src.services.image_generator.get_settings", return_value=mock_settings):
             with patch("src.services.image_generator.genai") as mock_genai:
-                mock_genai.GenerativeModel.return_value = mock_model
+                mock_genai.Client.return_value = mock_client
                 generator = ImageGenerator(mock_storage)
 
                 with pytest.raises(ImageGenerationError):
@@ -173,7 +182,7 @@ class TestImageGenerator:
         with patch("src.services.image_generator.get_settings", return_value=mock_settings):
             with patch("src.services.image_generator.genai"):
                 generator = ImageGenerator(mock_storage)
-                placeholder = generator._create_placeholder_image("Test Title")
+                placeholder = generator._create_placeholder_image()
 
         # Check PNG magic number
         assert placeholder[:8] == b"\x89PNG\r\n\x1a\n"

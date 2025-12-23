@@ -8,12 +8,13 @@ import pytest
 
 from src.worker.processor import (
     enqueue_job,
+    enqueue_resume,
     start_worker,
     _process_job,
     _run_pipeline,
     _update_stage,
-    _job_queue,
 )
+from src.queue.job_queue import get_job_queue, JobMessage, QueueBackend
 from src.models.job import Job, JobStatus, JobStage
 from src.services.pdf_extractor import PDFContent
 
@@ -63,29 +64,47 @@ class TestEnqueueJob:
 
     def test_enqueue_adds_to_queue(self) -> None:
         """Test that enqueue_job adds job ID to queue."""
-        # Clear the queue first
-        while not _job_queue.empty():
-            _job_queue.get_nowait()
+        queue = get_job_queue()
+        queue.clear()
 
         enqueue_job("test-job-123")
 
-        assert not _job_queue.empty()
-        assert _job_queue.get_nowait() == "test-job-123"
+        assert queue.size() == 1
+        message = queue.dequeue(timeout=1)
+        assert message is not None
+        assert message.job_id == "test-job-123"
+        assert message.action == "process"
 
     def test_enqueue_multiple_jobs(self) -> None:
         """Test enqueueing multiple jobs."""
-        # Clear the queue first
-        while not _job_queue.empty():
-            _job_queue.get_nowait()
+        queue = get_job_queue()
+        queue.clear()
 
         enqueue_job("job-1")
         enqueue_job("job-2")
         enqueue_job("job-3")
 
         # Jobs should be in FIFO order
-        assert _job_queue.get_nowait() == "job-1"
-        assert _job_queue.get_nowait() == "job-2"
-        assert _job_queue.get_nowait() == "job-3"
+        msg1 = queue.dequeue(timeout=1)
+        msg2 = queue.dequeue(timeout=1)
+        msg3 = queue.dequeue(timeout=1)
+        assert msg1.job_id == "job-1"
+        assert msg2.job_id == "job-2"
+        assert msg3.job_id == "job-3"
+
+    def test_enqueue_resume_adds_to_queue(self) -> None:
+        """Test that enqueue_resume adds resume message to queue."""
+        queue = get_job_queue()
+        queue.clear()
+
+        enqueue_resume("job-resume-123", "render")
+
+        assert queue.size() == 1
+        message = queue.dequeue(timeout=1)
+        assert message is not None
+        assert message.job_id == "job-resume-123"
+        assert message.action == "resume"
+        assert message.from_stage == "render"
 
 
 class TestStartWorker:
@@ -93,34 +112,33 @@ class TestStartWorker:
 
     def test_start_worker_creates_thread(self) -> None:
         """Test that start_worker creates a background thread."""
-        import src.worker.processor as worker_module
+        import src.queue.job_queue as queue_module
 
         # Reset the worker thread
-        worker_module._worker_thread = None
+        queue_module._worker_thread = None
 
-        with patch.object(worker_module, "_worker_loop") as mock_loop:
+        with patch.object(queue_module, "_worker_loop") as mock_loop:
             start_worker()
 
-            # Worker thread should exist and be alive
-            assert worker_module._worker_thread is not None
+            # Worker thread should exist
+            assert queue_module._worker_thread is not None
 
     def test_start_worker_is_idempotent(self) -> None:
         """Test that starting worker twice doesn't create duplicate threads when first is alive."""
-        import src.worker.processor as worker_module
+        import src.queue.job_queue as queue_module
         import threading
-        import time
 
         # Create a mock thread that appears alive
         mock_thread = MagicMock(spec=threading.Thread)
         mock_thread.is_alive.return_value = True
 
-        worker_module._worker_thread = mock_thread
+        queue_module._worker_thread = mock_thread
 
         # Start worker - should not replace the existing alive thread
         start_worker()
 
         # Should still be the mock thread
-        assert worker_module._worker_thread is mock_thread
+        assert queue_module._worker_thread is mock_thread
 
 
 class TestProcessJob:

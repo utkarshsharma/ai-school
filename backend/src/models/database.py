@@ -20,9 +20,23 @@ def get_engine():
         settings = get_settings()
         # Ensure storage directory exists
         settings.storage_base_path.mkdir(parents=True, exist_ok=True)
+
+        # SQLite-specific settings
+        connect_args = {}
+        engine_kwargs = {}
+
+        if "sqlite" in settings.database_url:
+            connect_args["check_same_thread"] = False
+        else:
+            # PostgreSQL connection pooling
+            engine_kwargs["pool_size"] = 10
+            engine_kwargs["max_overflow"] = 20
+            engine_kwargs["pool_pre_ping"] = True
+
         _engine = create_engine(
             settings.database_url,
-            connect_args={"check_same_thread": False},  # SQLite specific
+            connect_args=connect_args,
+            **engine_kwargs,
         )
     return _engine
 

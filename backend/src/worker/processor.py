@@ -13,10 +13,8 @@ runs as a background job, the API immediately returns a job ID.
 
 import json
 import logging
-import threading
 from datetime import datetime
 from pathlib import Path
-from queue import Queue
 
 from mutagen.mp3 import MP3
 from sqlalchemy.orm import Session
@@ -24,19 +22,26 @@ from sqlalchemy.orm import Session
 from src.models.database import get_session_local
 from src.models.job import Job, JobStatus, JobStage
 from src.schemas.timeline import Timeline
-from src.services.storage import get_storage_service, StorageService
+from src.services.storage import get_storage_service, StorageProtocol
 from src.services.pdf_extractor import get_pdf_extractor
 from src.services.content_generator import get_content_generator, ContentGenerationError
 from src.services.image_generator import get_image_generator, ImageGenerationError
 from src.services.tts import get_tts_service, TTSError, AudioSegment
 from src.clients.remotion import get_remotion_client, RemotionError
+from src.queue.job_queue import (
+    JobMessage,
+    enqueue_job as _queue_enqueue_job,
+    enqueue_resume as _queue_enqueue_resume,
+    start_worker as _queue_start_worker,
+    get_job_queue,
+)
 
 logger = logging.getLogger(__name__)
 
-# Simple in-memory job queue for MVP
-# Will be replaced with proper queue (Redis/RabbitMQ) in V1
-_job_queue: Queue[str] = Queue()
-_worker_thread: threading.Thread | None = None
+
+class JobCancelledError(Exception):
+    """Raised when a job is cancelled."""
+    pass
 
 
 def enqueue_job(job_id: str) -> None:
@@ -45,28 +50,36 @@ def enqueue_job(job_id: str) -> None:
     Args:
         job_id: Job ID to process
     """
-    logger.info(f"Enqueueing job: {job_id}")
-    _job_queue.put(job_id)
+    _queue_enqueue_job(job_id)
+
+
+def enqueue_resume(job_id: str, from_stage: str) -> None:
+    """Enqueue a job resume request.
+
+    Args:
+        job_id: Job ID to resume
+        from_stage: Stage to resume from
+    """
+    _queue_enqueue_resume(job_id, from_stage)
 
 
 def start_worker() -> None:
     """Start the background worker thread."""
-    global _worker_thread
-    if _worker_thread is None or not _worker_thread.is_alive():
-        _worker_thread = threading.Thread(target=_worker_loop, daemon=True)
-        _worker_thread.start()
-        logger.info("Background worker started")
+    _queue_start_worker(_process_message)
 
 
-def _worker_loop() -> None:
-    """Main worker loop - processes jobs from queue."""
-    while True:
-        try:
-            job_id = _job_queue.get()
-            logger.info(f"Processing job: {job_id}")
-            _process_job(job_id)
-        except Exception as e:
-            logger.error(f"Worker error: {e}", exc_info=True)
+def _process_message(message: JobMessage) -> None:
+    """Process a job message from the queue.
+
+    Routes to the appropriate handler based on message action.
+
+    Args:
+        message: Job message to process
+    """
+    if message.action == "resume":
+        _resume_job_from_stage(message.job_id, message.from_stage)
+    else:
+        _process_job(message.job_id)
 
 
 def _process_job(job_id: str) -> None:
@@ -91,6 +104,9 @@ def _process_job(job_id: str) -> None:
         storage = get_storage_service()
         _run_pipeline(job, db, storage)
 
+    except JobCancelledError:
+        logger.info(f"[{job_id}] Job was cancelled")
+        # Job is already marked as cancelled, nothing to do
     except Exception as e:
         logger.error(f"[{job_id}] Pipeline failed: {e}", exc_info=True)
         # Update job status in fresh session
@@ -105,7 +121,7 @@ def _process_job(job_id: str) -> None:
         db.close()
 
 
-def _run_pipeline(job: Job, db: Session, storage: StorageService) -> None:
+def _run_pipeline(job: Job, db: Session, storage: StorageProtocol) -> None:
     """Run the complete video generation pipeline.
 
     Args:
@@ -197,15 +213,49 @@ def _run_pipeline(job: Job, db: Session, storage: StorageService) -> None:
 
 
 def _update_stage(job: Job, db: Session, stage: JobStage, progress: int) -> None:
-    """Update job stage and progress."""
+    """Update job stage and progress with timing instrumentation.
+
+    When progress is 0, records the stage start time and checks for cancellation.
+    When progress is 100, calculates and stores the stage duration.
+
+    Raises:
+        JobCancelledError: If cancel_requested flag is set
+    """
+    # Check for cancellation request at stage boundaries
+    if progress == 0:
+        # Refresh job to get latest cancel_requested value
+        db.refresh(job)
+        if job.cancel_requested:
+            logger.info(f"[{job.id}] Cancellation detected before stage {stage.value}")
+            job.mark_cancelled()
+            db.commit()
+            raise JobCancelledError(f"Job {job.id} was cancelled")
+
     job.status = JobStatus.PROCESSING
     job.current_stage = stage
     job.stage_progress = progress
     job.updated_at = datetime.utcnow()
+
+    # Track timing for observability
+    if progress == 0:
+        # Stage starting - record start time
+        job.stage_started_at = datetime.utcnow()
+        logger.info(f"[{job.id}] Stage {stage.value} started")
+    elif progress == 100:
+        # Stage complete - calculate and store duration
+        if job.stage_started_at:
+            duration = (datetime.utcnow() - job.stage_started_at).total_seconds()
+            # Ensure stage_durations is a dict (may be None from DB)
+            if job.stage_durations is None:
+                job.stage_durations = {}
+            job.stage_durations[stage.value] = round(duration, 2)
+            logger.info(f"[{job.id}] Stage {stage.value} completed in {duration:.2f}s")
+        job.stage_started_at = None  # Reset for next stage
+
     db.commit()
 
 
-def resume_job_from_stage(job_id: str, from_stage: str) -> None:
+def _resume_job_from_stage(job_id: str, from_stage: str) -> None:
     """Resume a job from a specific stage using existing artifacts.
 
     This allows resuming failed jobs without re-running expensive stages.
@@ -328,18 +378,3 @@ def _get_audio_duration(path: Path) -> float:
         return 0
 
 
-def enqueue_resume(job_id: str, from_stage: str) -> None:
-    """Enqueue a job resume request.
-
-    Args:
-        job_id: Job ID to resume
-        from_stage: Stage to resume from
-    """
-    # For now, run directly in a new thread (simpler than extending queue)
-    thread = threading.Thread(
-        target=resume_job_from_stage,
-        args=(job_id, from_stage),
-        daemon=True,
-    )
-    thread.start()
-    logger.info(f"Started resume thread for job {job_id} from stage {from_stage}")

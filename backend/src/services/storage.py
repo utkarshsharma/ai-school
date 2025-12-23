@@ -6,11 +6,93 @@ swapped for cloud storage (S3/Supabase) in future versions.
 
 import shutil
 from pathlib import Path
+from typing import Protocol
 
 from src.config import get_settings
 
 
-class StorageService:
+class StorageProtocol(Protocol):
+    """Protocol defining the storage service interface.
+
+    Any storage backend (local, S3, GCS) must implement these methods.
+    This enables swapping storage implementations without changing consuming code.
+    """
+
+    @property
+    def base_path(self) -> Path:
+        """Get base storage path."""
+        ...
+
+    def save_pdf(self, job_id: str, content: bytes, filename: str) -> Path:
+        """Save uploaded PDF file."""
+        ...
+
+    def get_pdf_path(self, job_id: str, filename: str) -> Path:
+        """Get path to a stored PDF."""
+        ...
+
+    def save_timeline(self, job_id: str, content: str) -> Path:
+        """Save timeline JSON."""
+        ...
+
+    def get_timeline_path(self, job_id: str) -> Path:
+        """Get path to timeline JSON."""
+        ...
+
+    def save_audio(self, job_id: str, segment_id: str, content: bytes) -> Path:
+        """Save audio segment."""
+        ...
+
+    def get_audio_dir(self, job_id: str) -> Path:
+        """Get directory for job's audio files."""
+        ...
+
+    def save_image(self, job_id: str, segment_id: str, content: bytes) -> Path:
+        """Save slide image."""
+        ...
+
+    def get_images_dir(self, job_id: str) -> Path:
+        """Get directory for job's image files."""
+        ...
+
+    def get_video_path(self, job_id: str) -> Path:
+        """Get path for output video."""
+        ...
+
+    def delete_job_artifacts(self, job_id: str) -> None:
+        """Delete all artifacts for a job."""
+        ...
+
+    def has_timeline(self, job_id: str) -> bool:
+        """Check if timeline JSON exists for job."""
+        ...
+
+    def has_images(self, job_id: str) -> bool:
+        """Check if images directory exists and has files."""
+        ...
+
+    def has_audio(self, job_id: str) -> bool:
+        """Check if audio directory exists and has files."""
+        ...
+
+    def load_timeline_json(self, job_id: str) -> str | None:
+        """Load timeline JSON content if it exists."""
+        ...
+
+    def list_images(self, job_id: str) -> dict[str, Path]:
+        """List all images for a job, keyed by segment_id."""
+        ...
+
+    def list_audio(self, job_id: str) -> dict[str, Path]:
+        """List all audio files for a job, keyed by segment_id."""
+        ...
+
+    def get_existing_artifacts(self, job_id: str) -> dict[str, bool]:
+        """Get summary of which artifacts exist for a job."""
+        ...
+
+
+class LocalStorageService:
     """Local filesystem storage service."""
 
     def __init__(self) -> None:
@@ -188,12 +270,20 @@ class StorageService:
 
 
 # Singleton instance
-_storage_service: StorageService | None = None
+_storage_service: LocalStorageService | None = None
 
 
-def get_storage_service() -> StorageService:
-    """Get storage service singleton."""
+def get_storage_service() -> StorageProtocol:
+    """Get storage service singleton.
+
+    Returns a StorageProtocol implementation. Currently uses LocalStorageService,
+    but can be swapped for cloud storage in production.
+    """
     global _storage_service
     if _storage_service is None:
-        _storage_service = StorageService()
+        _storage_service = LocalStorageService()
     return _storage_service
+
+
+# Backwards compatibility alias
+StorageService = LocalStorageService
