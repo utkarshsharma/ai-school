@@ -10,10 +10,11 @@ import json
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from queue import Queue
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -284,40 +285,78 @@ def get_next_job() -> Optional[JobMessage]:
     return queue.dequeue()
 
 
-# Worker thread management
-_worker_thread: Optional[threading.Thread] = None
+# Worker thread pool management
+_worker_pool: Optional[ThreadPoolExecutor] = None
+_worker_threads: list[threading.Thread] = []
+_pool_lock = threading.Lock()
+
+# Configurable worker count via environment variable
+WORKER_COUNT = int(os.getenv("WORKER_COUNT", "4"))
 
 
-def start_worker(processor_func) -> None:
-    """Start the background worker thread.
+def start_worker(processor_func: Callable[[JobMessage], None], num_workers: int = None) -> None:
+    """Start the background worker thread pool.
+
+    Spawns multiple worker threads that process jobs concurrently.
+    Each worker independently pulls jobs from the queue.
 
     Args:
         processor_func: Function to call for each job message.
                        Signature: (JobMessage) -> None
+        num_workers: Number of worker threads. Defaults to WORKER_COUNT env var (4).
     """
-    global _worker_thread
-    if _worker_thread is None or not _worker_thread.is_alive():
-        _worker_thread = threading.Thread(
-            target=_worker_loop,
-            args=(processor_func,),
-            daemon=True,
-        )
-        _worker_thread.start()
+    global _worker_pool, _worker_threads
+    num_workers = num_workers or WORKER_COUNT
+
+    with _pool_lock:
+        # Check if workers are already running
+        active_workers = sum(1 for t in _worker_threads if t.is_alive())
+        if active_workers >= num_workers:
+            return
+
+        # Start new workers up to the desired count
+        workers_to_start = num_workers - active_workers
         queue = get_job_queue()
-        logger.info(f"Background worker started (backend: {queue.backend.value})")
+
+        for i in range(workers_to_start):
+            worker_id = len(_worker_threads) + 1
+            thread = threading.Thread(
+                target=_worker_loop,
+                args=(processor_func, worker_id),
+                daemon=True,
+                name=f"worker-{worker_id}",
+            )
+            thread.start()
+            _worker_threads.append(thread)
+
+        logger.info(
+            f"Started {workers_to_start} worker(s), "
+            f"total active: {num_workers} (backend: {queue.backend.value})"
+        )
 
 
-def _worker_loop(processor_func) -> None:
+def _worker_loop(processor_func: Callable[[JobMessage], None], worker_id: int = 1) -> None:
     """Main worker loop - processes jobs from queue.
+
+    Each worker independently pulls jobs and processes them.
+    Multiple workers enable concurrent job processing.
 
     Args:
         processor_func: Function to call for each job message
+        worker_id: Identifier for this worker (for logging)
     """
+    logger.info(f"[Worker-{worker_id}] Started and waiting for jobs")
     while True:
         try:
             message = get_next_job()
             if message:
-                logger.info(f"Processing: {message.job_id} ({message.action})")
+                logger.info(f"[Worker-{worker_id}] Processing: {message.job_id} ({message.action})")
                 processor_func(message)
+                logger.info(f"[Worker-{worker_id}] Completed: {message.job_id}")
         except Exception as e:
-            logger.error(f"Worker error: {e}", exc_info=True)
+            logger.error(f"[Worker-{worker_id}] Error: {e}", exc_info=True)
+
+
+def get_worker_count() -> int:
+    """Get the number of active worker threads."""
+    return sum(1 for t in _worker_threads if t.is_alive())

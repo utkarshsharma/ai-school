@@ -110,35 +110,38 @@ class TestEnqueueJob:
 class TestStartWorker:
     """Tests for start_worker function."""
 
-    def test_start_worker_creates_thread(self) -> None:
-        """Test that start_worker creates a background thread."""
+    def test_start_worker_creates_threads(self) -> None:
+        """Test that start_worker creates background worker threads."""
         import src.queue.job_queue as queue_module
 
-        # Reset the worker thread
-        queue_module._worker_thread = None
+        # Reset the worker threads
+        queue_module._worker_threads = []
 
         with patch.object(queue_module, "_worker_loop") as mock_loop:
-            start_worker()
+            start_worker(num_workers=2)
 
-            # Worker thread should exist
-            assert queue_module._worker_thread is not None
+            # Worker threads should exist
+            assert len(queue_module._worker_threads) == 2
 
     def test_start_worker_is_idempotent(self) -> None:
-        """Test that starting worker twice doesn't create duplicate threads when first is alive."""
+        """Test that starting worker twice doesn't create duplicate threads when all are alive."""
         import src.queue.job_queue as queue_module
         import threading
 
-        # Create a mock thread that appears alive
-        mock_thread = MagicMock(spec=threading.Thread)
-        mock_thread.is_alive.return_value = True
+        # Create mock threads that appear alive
+        mock_threads = []
+        for _ in range(4):
+            mock_thread = MagicMock(spec=threading.Thread)
+            mock_thread.is_alive.return_value = True
+            mock_threads.append(mock_thread)
 
-        queue_module._worker_thread = mock_thread
+        queue_module._worker_threads = mock_threads
 
-        # Start worker - should not replace the existing alive thread
-        start_worker()
+        # Start worker - should not create new threads since all are alive
+        start_worker(num_workers=4)
 
-        # Should still be the mock thread
-        assert queue_module._worker_thread is mock_thread
+        # Should still have the same threads
+        assert queue_module._worker_threads == mock_threads
 
 
 class TestProcessJob:

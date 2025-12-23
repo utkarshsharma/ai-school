@@ -63,9 +63,13 @@ def enqueue_resume(job_id: str, from_stage: str) -> None:
     _queue_enqueue_resume(job_id, from_stage)
 
 
-def start_worker() -> None:
-    """Start the background worker thread."""
-    _queue_start_worker(_process_message)
+def start_worker(num_workers: int = None) -> None:
+    """Start the background worker thread pool.
+
+    Args:
+        num_workers: Number of worker threads. Defaults to WORKER_COUNT env var (4).
+    """
+    _queue_start_worker(_process_message, num_workers=num_workers)
 
 
 def _process_message(message: JobMessage) -> None:

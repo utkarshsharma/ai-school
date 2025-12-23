@@ -6,6 +6,8 @@ Uses REST API with API key authentication for simplicity.
 import base64
 import io
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +19,9 @@ from src.schemas.timeline import Timeline
 from src.services.storage import StorageService
 
 logger = logging.getLogger(__name__)
+
+# Number of parallel TTS generation workers (default: 4)
+TTS_WORKERS = int(os.getenv("TTS_WORKERS", "4"))
 
 TTS_API_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
@@ -65,38 +70,59 @@ class TTSService:
         timeline: Timeline,
         job_id: str,
     ) -> list[AudioSegment]:
-        """Generate audio for all segments in timeline.
+        """Generate audio for all segments in timeline in parallel.
+
+        Uses ThreadPoolExecutor to generate multiple audio segments concurrently.
+        Google TTS API has generous rate limits, so parallel generation is safe.
 
         Args:
             timeline: Validated timeline with narration text
             job_id: Job identifier
 
         Returns:
-            List of generated audio segments
+            List of generated audio segments (in timeline order)
 
         Raises:
             TTSError: If any audio generation fails
         """
-        logger.info(f"[{job_id}] Generating audio for {len(timeline.segments)} segments")
+        num_segments = len(timeline.segments)
+        logger.info(f"[{job_id}] Generating audio for {num_segments} segments (parallel, {TTS_WORKERS} workers)")
 
-        audio_segments: list[AudioSegment] = []
+        segment_results: dict[str, AudioSegment] = {}
+        errors: list[str] = []
 
-        for segment in timeline.segments:
-            try:
-                audio_segment = self._generate_segment_audio(
+        # Use ThreadPoolExecutor for parallel audio generation
+        with ThreadPoolExecutor(max_workers=TTS_WORKERS) as executor:
+            # Submit all audio generation tasks
+            futures = {
+                executor.submit(
+                    self._generate_segment_audio,
                     segment_id=segment.segment_id,
                     text=segment.narration_text,
                     target_duration=segment.duration_seconds,
                     job_id=job_id,
-                )
-                audio_segments.append(audio_segment)
-            except Exception as e:
-                logger.error(
-                    f"[{job_id}] Failed to generate audio for {segment.segment_id}: {e}"
-                )
-                raise TTSError(
-                    f"Audio generation failed for {segment.segment_id}: {e}"
-                ) from e
+                ): segment.segment_id
+                for segment in timeline.segments
+            }
+
+            # Collect results as they complete
+            for future in as_completed(futures):
+                segment_id = futures[future]
+                try:
+                    audio_segment = future.result()
+                    segment_results[segment_id] = audio_segment
+                    logger.info(f"[{job_id}] Audio ready: {segment_id} ({len(segment_results)}/{num_segments})")
+                except Exception as e:
+                    error_msg = f"Audio generation failed for {segment_id}: {e}"
+                    logger.error(f"[{job_id}] {error_msg}")
+                    errors.append(error_msg)
+
+        # If any errors occurred, raise with all error messages
+        if errors:
+            raise TTSError("; ".join(errors))
+
+        # Maintain timeline order (important for video rendering)
+        audio_segments = [segment_results[seg.segment_id] for seg in timeline.segments]
 
         logger.info(f"[{job_id}] Generated {len(audio_segments)} audio segments")
         return audio_segments

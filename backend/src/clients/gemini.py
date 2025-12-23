@@ -2,6 +2,8 @@
 
 import json
 import logging
+import os
+import threading
 from typing import Any
 
 import google.generativeai as genai
@@ -9,6 +11,45 @@ import google.generativeai as genai
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+class GeminiRateLimiter:
+    """Thread-safe rate limiter for Gemini API calls.
+
+    Limits concurrent API calls to avoid hitting rate limits,
+    especially important when generating images in parallel.
+    """
+
+    def __init__(self, max_concurrent: int = 3):
+        """Initialize the rate limiter.
+
+        Args:
+            max_concurrent: Maximum concurrent Gemini API calls.
+                          Default is 3 to stay well under the 60 req/min limit.
+        """
+        self._semaphore = threading.Semaphore(max_concurrent)
+        self._max = max_concurrent
+        logger.info(f"Gemini rate limiter initialized: max {max_concurrent} concurrent calls")
+
+    def __enter__(self):
+        self._semaphore.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self._semaphore.release()
+
+
+# Global rate limiter - controls concurrent Gemini calls across all threads
+_rate_limiter: GeminiRateLimiter | None = None
+
+
+def get_gemini_rate_limiter() -> GeminiRateLimiter:
+    """Get the global Gemini rate limiter singleton."""
+    global _rate_limiter
+    if _rate_limiter is None:
+        max_concurrent = int(os.getenv("GEMINI_MAX_CONCURRENT", "3"))
+        _rate_limiter = GeminiRateLimiter(max_concurrent=max_concurrent)
+    return _rate_limiter
 
 # Model constants from INSTRUCTIONS.md
 CONTENT_MODEL = "gemini-3-flash-preview"  # For timeline generation

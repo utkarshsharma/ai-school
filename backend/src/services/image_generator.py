@@ -6,16 +6,22 @@ with prompts optimized for clean, minimalist, pedagogy-first slides.
 
 import io
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from google import genai
 from PIL import Image
 
+from src.clients.gemini import get_gemini_rate_limiter
 from src.config import get_settings
 from src.schemas.timeline import Timeline
 from src.services.storage import StorageService
 
 logger = logging.getLogger(__name__)
+
+# Number of parallel image generation workers (default: 4)
+IMAGE_WORKERS = int(os.getenv("IMAGE_WORKERS", "4"))
 
 # Model for image generation per INSTRUCTIONS.md
 IMAGE_MODEL = "gemini-2.5-flash-image"
@@ -39,7 +45,10 @@ class ImageGenerator:
         self._client = genai.Client(api_key=settings.gemini_api_key)
 
     def generate_images(self, timeline: Timeline, job_id: str) -> dict[str, Path]:
-        """Generate slide images for all segments.
+        """Generate slide images for all segments in parallel.
+
+        Uses ThreadPoolExecutor to generate multiple images concurrently,
+        controlled by the Gemini rate limiter to avoid API rate limits.
 
         Args:
             timeline: Validated timeline with visual prompts
@@ -51,26 +60,41 @@ class ImageGenerator:
         Raises:
             ImageGenerationError: If any image generation fails
         """
-        logger.info(f"[{job_id}] Generating {len(timeline.segments)} slide images")
+        num_segments = len(timeline.segments)
+        logger.info(f"[{job_id}] Generating {num_segments} slide images (parallel, {IMAGE_WORKERS} workers)")
 
         image_paths: dict[str, Path] = {}
+        errors: list[str] = []
 
-        for segment in timeline.segments:
-            try:
-                image_path = self._generate_slide_image(
+        # Use ThreadPoolExecutor for parallel image generation
+        with ThreadPoolExecutor(max_workers=IMAGE_WORKERS) as executor:
+            # Submit all image generation tasks
+            futures = {
+                executor.submit(
+                    self._generate_slide_image,
                     segment_id=segment.segment_id,
                     title=segment.slide.title,
                     visual_prompt=segment.slide.visual_prompt,
                     job_id=job_id,
-                )
-                image_paths[segment.segment_id] = image_path
-            except Exception as e:
-                logger.error(
-                    f"[{job_id}] Failed to generate image for {segment.segment_id}: {e}"
-                )
-                raise ImageGenerationError(
-                    f"Image generation failed for {segment.segment_id}: {e}"
-                ) from e
+                ): segment.segment_id
+                for segment in timeline.segments
+            }
+
+            # Collect results as they complete
+            for future in as_completed(futures):
+                segment_id = futures[future]
+                try:
+                    image_path = future.result()
+                    image_paths[segment_id] = image_path
+                    logger.info(f"[{job_id}] Image ready: {segment_id} ({len(image_paths)}/{num_segments})")
+                except Exception as e:
+                    error_msg = f"Image generation failed for {segment_id}: {e}"
+                    logger.error(f"[{job_id}] {error_msg}")
+                    errors.append(error_msg)
+
+        # If any errors occurred, raise with all error messages
+        if errors:
+            raise ImageGenerationError("; ".join(errors))
 
         logger.info(f"[{job_id}] Generated {len(image_paths)} slide images")
         return image_paths
@@ -84,6 +108,8 @@ class ImageGenerator:
     ) -> Path:
         """Generate a single slide background image.
 
+        Uses the Gemini rate limiter to control concurrent API calls.
+
         Args:
             segment_id: Segment identifier
             title: Slide title for context
@@ -93,6 +119,7 @@ class ImageGenerator:
         Returns:
             Path to generated image
         """
+        rate_limiter = get_gemini_rate_limiter()
         logger.info(f"[{job_id}] Generating image for {segment_id}")
 
         # Build prompt optimized for clean, educational slides
@@ -115,33 +142,35 @@ STYLE REQUIREMENTS:
 Generate a single image that serves as an effective slide background."""
 
         try:
-            response = self._client.models.generate_content(
-                model=IMAGE_MODEL,
-                contents=[full_prompt],
-            )
+            # Use rate limiter to control concurrent API calls
+            with rate_limiter:
+                response = self._client.models.generate_content(
+                    model=IMAGE_MODEL,
+                    contents=[full_prompt],
+                )
 
-            # Extract image from response parts
-            for part in response.parts:
-                if part.inline_data is not None:
-                    # Get the raw image bytes directly from inline_data
-                    image_data = part.inline_data.data
+                # Extract image from response parts
+                for part in response.parts:
+                    if part.inline_data is not None:
+                        # Get the raw image bytes directly from inline_data
+                        image_data = part.inline_data.data
 
-                    # If data is base64 encoded string, decode it
-                    if isinstance(image_data, str):
-                        import base64
-                        image_data = base64.b64decode(image_data)
+                        # If data is base64 encoded string, decode it
+                        if isinstance(image_data, str):
+                            import base64
+                            image_data = base64.b64decode(image_data)
 
-                    # Save image
-                    image_path = self._storage.save_image(job_id, segment_id, image_data)
-                    logger.info(f"[{job_id}] Saved image: {image_path}")
-                    return image_path
+                        # Save image
+                        image_path = self._storage.save_image(job_id, segment_id, image_data)
+                        logger.info(f"[{job_id}] Saved image: {image_path}")
+                        return image_path
 
-            # No image found in response
-            logger.warning(
-                f"[{job_id}] No image in response for {segment_id}, using placeholder"
-            )
-            image_data = self._create_placeholder_image()
-            return self._storage.save_image(job_id, segment_id, image_data)
+                # No image found in response
+                logger.warning(
+                    f"[{job_id}] No image in response for {segment_id}, using placeholder"
+                )
+                image_data = self._create_placeholder_image()
+                return self._storage.save_image(job_id, segment_id, image_data)
 
         except Exception as e:
             logger.error(f"[{job_id}] Image generation error: {e}")

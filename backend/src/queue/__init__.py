@@ -7,7 +7,9 @@ from src.queue.job_queue import (
     enqueue_resume,
     get_next_job,
     start_worker,
+    get_worker_count,
     QueueBackend,
+    WORKER_COUNT,
 )
 
 __all__ = [
@@ -17,5 +19,7 @@ __all__ = [
     "enqueue_resume",
     "get_next_job",
     "start_worker",
+    "get_worker_count",
     "QueueBackend",
+    "WORKER_COUNT",
 ]
