@@ -93,7 +93,8 @@ class GeminiClient:
     ) -> dict[str, Any]:
         """Generate video timeline from PDF content.
 
-        Uses retry with exponential backoff for transient errors.
+        Uses rate limiting to prevent API overload and retry with
+        exponential backoff for transient errors.
 
         Args:
             pdf_content: Extracted text from PDF
@@ -109,44 +110,47 @@ class GeminiClient:
         logger.info(f"[{job_id}] Generating timeline for: {filename}")
 
         prompt = self._build_timeline_prompt(pdf_content, filename)
+        rate_limiter = get_gemini_rate_limiter()
 
         def _call_api() -> dict[str, Any]:
-            """Inner function for API call with retry logic."""
-            try:
-                response = self._content_model.generate_content(
-                    prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=0.7,
-                        top_p=0.95,
-                        max_output_tokens=8192,
-                        response_mime_type="application/json",
-                    ),
-                )
-
-                if not response.text:
-                    # Empty response is retryable
-                    raise GeminiRetryableError("Empty response from Gemini")
-
-                # Parse JSON response
+            """Inner function for API call with rate limiting and retry."""
+            # Use rate limiter to prevent concurrent API overload
+            with rate_limiter:
                 try:
-                    timeline_data = json.loads(response.text)
-                except json.JSONDecodeError as e:
-                    # JSON parse error is retryable (might be truncated response)
-                    raise GeminiRetryableError(f"Invalid JSON response: {e}") from e
+                    response = self._content_model.generate_content(
+                        prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=0.7,
+                            top_p=0.95,
+                            max_output_tokens=8192,
+                            response_mime_type="application/json",
+                        ),
+                    )
 
-                logger.info(
-                    f"[{job_id}] Generated timeline with "
-                    f"{len(timeline_data.get('segments', []))} segments"
-                )
+                    if not response.text:
+                        # Empty response is retryable
+                        raise GeminiRetryableError("Empty response from Gemini")
 
-                return timeline_data
+                    # Parse JSON response
+                    try:
+                        timeline_data = json.loads(response.text)
+                    except json.JSONDecodeError as e:
+                        # JSON parse error is retryable (might be truncated response)
+                        raise GeminiRetryableError(f"Invalid JSON response: {e}") from e
 
-            except GeminiRetryableError:
-                raise
-            except Exception as e:
-                # Treat other API errors as retryable
-                logger.warning(f"[{job_id}] Gemini API error (will retry): {e}")
-                raise GeminiRetryableError(f"Gemini API error: {e}") from e
+                    logger.info(
+                        f"[{job_id}] Generated timeline with "
+                        f"{len(timeline_data.get('segments', []))} segments"
+                    )
+
+                    return timeline_data
+
+                except GeminiRetryableError:
+                    raise
+                except Exception as e:
+                    # Treat other API errors as retryable
+                    logger.warning(f"[{job_id}] Gemini API error (will retry): {e}")
+                    raise GeminiRetryableError(f"Gemini API error: {e}") from e
 
         try:
             return retry_call(
